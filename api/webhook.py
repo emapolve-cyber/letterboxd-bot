@@ -280,3 +280,256 @@ def build_weekly_report_text(collected):
         lines.append(f"- {html.escape(display_name)}: {count} {plural}")
 
     lines.append("")
+    lines.append("<b>Top 5 per voto</b>")
+    if not top5:
+        lines.append("Nessun film votato questa settimana.")
+    else:
+        for i, (rating_value, display_name, entry) in enumerate(top5, start=1):
+            film_title = entry.get("letterboxd_filmtitle") or entry.get("title", "Film")
+            film_year = entry.get("letterboxd_filmyear")
+            link = entry.get("link", "")
+            title_part = html.escape(film_title)
+            if film_year:
+                title_part += f" ({html.escape(str(film_year))})"
+            stars = stars_from_rating(rating_value)
+            lines.append(
+                f"{i}. <a href=\"{html.escape(link)}\">{title_part}</a> {stars} — {html.escape(display_name)}"
+            )
+
+    return "\n".join(lines)
+
+
+# ---- TMDB poster lookup ---------------------------------------------
+
+
+def tmdb_poster_url(title, year):
+    if not TMDB_API_KEY:
+        return None
+    try:
+        params = {"api_key": TMDB_API_KEY, "query": title}
+        if year:
+            params["year"] = year
+        resp = requests.get(TMDB_SEARCH_URL, params=params, timeout=10)
+        resp.raise_for_status()
+        results = resp.json().get("results") or []
+        if not results:
+            return None
+        poster_path = results[0].get("poster_path")
+        if not poster_path:
+            return None
+        return TMDB_IMAGE_BASE + poster_path
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warn] TMDB lookup failed for '{title}': {exc}", file=sys.stderr)
+        return None
+
+
+def collect_poster_urls(collected, limit=MAX_ALBUM_SIZE):
+    urls = []
+    for _display_name, entry in collected:
+        if len(urls) >= limit:
+            break
+        film_title = entry.get("letterboxd_filmtitle")
+        if not film_title:
+            continue
+        poster = tmdb_poster_url(film_title, entry.get("letterboxd_filmyear"))
+        if poster:
+            urls.append(poster)
+    return urls
+
+
+# ---- Telegram sending -------------------------------------------------
+
+
+def send_telegram_message(chat_id, text):
+    resp = requests.post(
+        TELEGRAM_API.format(token=TOKEN),
+        data={
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+        timeout=30,
+    )
+    if not resp.ok:
+        print(f"[error] Telegram API error {resp.status_code}: {resp.text}", file=sys.stderr)
+        resp.raise_for_status()
+
+
+def send_photo_album(chat_id, urls):
+    if not urls:
+        return
+    try:
+        if len(urls) == 1:
+            resp = requests.post(
+                TELEGRAM_PHOTO_API.format(token=TOKEN),
+                data={"chat_id": chat_id, "photo": urls[0]},
+                timeout=30,
+            )
+        else:
+            media = [{"type": "photo", "media": u} for u in urls[:MAX_ALBUM_SIZE]]
+            resp = requests.post(
+                TELEGRAM_MEDIA_GROUP_API.format(token=TOKEN),
+                data={"chat_id": chat_id, "media": json.dumps(media)},
+                timeout=30,
+            )
+        if not resp.ok:
+            print(f"[warn] failed to send poster album: {resp.status_code} {resp.text}", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warn] failed to send poster album: {exc}", file=sys.stderr)
+
+
+def run_and_send_digest(chat_id, header_text="Letterboxd - riepilogo"):
+    since = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
+    collected = collect_entries(chat_id, since)
+
+    poster_urls = collect_poster_urls(collected)
+    if poster_urls:
+        send_photo_album(chat_id, poster_urls)
+
+    for msg in build_text_messages(collected, header_text):
+        send_telegram_message(chat_id, msg)
+
+
+def run_and_send_weekly_report(chat_id):
+    since = datetime.now(timezone.utc) - timedelta(hours=WEEKLY_LOOKBACK_HOURS)
+    collected = collect_entries(chat_id, since)
+    send_telegram_message(chat_id, build_weekly_report_text(collected))
+
+
+def is_update_command(text):
+    if not text:
+        return False
+    text = text.strip().lower()
+    if text.startswith("/update"):
+        return True
+    if BOT_USERNAME and f"@{BOT_USERNAME}" in text and "update" in text:
+        return True
+    return False
+
+
+def is_top_command(text):
+    if not text:
+        return False
+    return text.strip().lower().startswith("/top")
+
+
+def is_stop_command(text):
+    if not text:
+        return False
+    return text.strip().lower().startswith("/stop")
+
+
+# ---- user-management commands --------------------------------------------
+
+HELP_TEXT = (
+    "<b>Comandi disponibili</b>\n"
+    "/update - manda subito il riepilogo di questo gruppo\n"
+    "/top - report settimanale: film visti per utente e top 5 per voto\n"
+    "/lista - mostra gli utenti monitorati in questo gruppo\n"
+    "/aggiungi Nome Cognome usernameletterboxd - aggiungi un utente a questo gruppo\n"
+    "/rimuovi usernameletterboxd - rimuovi un utente da questo gruppo\n"
+    "/stop - disattiva il digest giornaliero in questo gruppo\n"
+    "/help - mostra questo messaggio\n\n"
+    "Ogni gruppo ha la propria lista di utenti Letterboxd, indipendente dagli altri."
+)
+
+
+def handle_command(text, chat_id):
+    """Returns a reply string if this text was a recognized management
+    command, otherwise None (so the caller can fall through to other
+    handling, e.g. is_update_command / is_top_command / is_stop_command)."""
+    if not text:
+        return None
+    stripped = text.strip()
+    lower = stripped.lower()
+
+    if lower.startswith("/help"):
+        return HELP_TEXT
+
+    if lower.startswith("/lista"):
+        users = get_users(chat_id)
+        if not users:
+            return "Nessun utente configurato in questo gruppo. Usa /aggiungi per iniziare."
+        lines = [f"- {html.escape(name)} → {html.escape(uname)}" for name, uname in users.items()]
+        return "<b>Utenti monitorati in questo gruppo:</b>\n" + "\n".join(lines)
+
+    if lower.startswith("/aggiungi"):
+        parts = stripped.split()
+        if len(parts) < 3:
+            return "Uso corretto: /aggiungi Nome Cognome usernameletterboxd"
+        username = parts[-1]
+        display_name = " ".join(parts[1:-1])
+        users = get_users(chat_id)
+        users[display_name] = username
+        save_users(chat_id, users)
+        return f"Aggiunto a questo gruppo: {html.escape(display_name)} → {html.escape(username)}"
+
+    if lower.startswith("/rimuovi"):
+        parts = stripped.split()
+        if len(parts) != 2:
+            return "Uso corretto: /rimuovi usernameletterboxd"
+        target = parts[1].lower()
+        users = get_users(chat_id)
+        to_delete = [name for name, uname in users.items() if uname.lower() == target]
+        if not to_delete:
+            return f"Nessun utente trovato con username '{html.escape(parts[1])}' in questo gruppo"
+        for name in to_delete:
+            del users[name]
+        save_users(chat_id, users)
+        return f"Rimosso da questo gruppo: {html.escape(', '.join(to_delete))}"
+
+    return None
+
+
+# ---- Vercel entrypoint -------------------------------------------------
+
+class handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        body = self.rfile.read(length) if length else b"{}"
+        try:
+            update = json.loads(body or b"{}")
+        except json.JSONDecodeError:
+            update = {}
+
+        message = update.get("message") or update.get("channel_post") or {}
+        text = message.get("text", "")
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
+
+        try:
+            if chat_id is None:
+                pass
+            elif is_stop_command(text):
+                remove_active_chat(chat_id)
+                send_telegram_message(
+                    chat_id,
+                    "Digest giornaliero disattivato in questo gruppo. "
+                    "Gli altri comandi restano comunque disponibili.",
+                )
+            else:
+                reply = handle_command(text, chat_id)
+                if reply is not None:
+                    add_active_chat(chat_id)
+                    send_telegram_message(chat_id, reply)
+                elif is_top_command(text):
+                    add_active_chat(chat_id)
+                    run_and_send_weekly_report(chat_id)
+                elif is_update_command(text):
+                    add_active_chat(chat_id)
+                    run_and_send_digest(chat_id, header_text="Letterboxd - riepilogo")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[error] failed to handle message: {exc}", file=sys.stderr)
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"ok": true}')
+
+    def do_GET(self):
+        # simple health check
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"webhook alive")
