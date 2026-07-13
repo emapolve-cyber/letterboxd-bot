@@ -2,8 +2,15 @@
 Vercel serverless function: Telegram webhook.
 File path in the repo must be: api/webhook.py
 
-Handles incoming Telegram updates. If the message is "/update" (or mentions
-the bot followed by "update"), it immediately sends the Letterboxd recap.
+Handles incoming Telegram updates:
+  - "/update" (or "@bot update")      -> sends the Letterboxd recap now
+  - "/aggiungi Nome Cognome username" -> adds a user to track
+  - "/rimuovi username"               -> removes a tracked user
+  - "/lista"                          -> lists tracked users
+  - "/help"                           -> shows available commands
+
+The list of tracked users is stored in Upstash Redis (free tier, no card)
+so it survives across deploys and can be edited from Telegram directly.
 """
 
 import os
@@ -11,15 +18,30 @@ import sys
 import json
 import html
 import time
+from urllib.parse import quote
 from http.server import BaseHTTPRequestHandler
 from datetime import datetime, timezone, timedelta
 
 import feedparser
 import requests
 
-# ---- shared config ---------------------------------------------------
+# ---- config -------------------------------------------------------------
 
-USERS = {
+RSS_URL = "https://letterboxd.com/{username}/rss/"
+TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
+MAX_MESSAGE_LEN = 4000
+
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+BOT_USERNAME = os.environ.get("TELEGRAM_BOT_USERNAME", "").lstrip("@").lower()
+LOOKBACK_HOURS = float(os.environ.get("LOOKBACK_HOURS", "24"))
+
+REDIS_URL = os.environ["UPSTASH_REDIS_REST_URL"].rstrip("/")
+REDIS_TOKEN = os.environ["UPSTASH_REDIS_REST_TOKEN"]
+USERS_KEY = "letterboxd:users"
+
+# Seed list used only the very first time (when Redis has no data yet).
+DEFAULT_USERS = {
     "andrea beni": "andreonbenon",
     "Lorenzo Sartor": "lorenzosartor",
     "Davide Colli": "david_hills",
@@ -30,14 +52,42 @@ USERS = {
     "Emanuele Polverino": "EmaPolve",
 }
 
-RSS_URL = "https://letterboxd.com/{username}/rss/"
-TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
-MAX_MESSAGE_LEN = 4000
+# ---- Upstash Redis (tiny REST-based key/value store) --------------------
 
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-BOT_USERNAME = os.environ.get("TELEGRAM_BOT_USERNAME", "").lstrip("@").lower()
-LOOKBACK_HOURS = float(os.environ.get("LOOKBACK_HOURS", "24"))
+
+def redis_get(key):
+    resp = requests.get(
+        f"{REDIS_URL}/get/{key}",
+        headers={"Authorization": f"Bearer {REDIS_TOKEN}"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json().get("result")
+
+
+def redis_set(key, value):
+    encoded = quote(value, safe="")
+    resp = requests.post(
+        f"{REDIS_URL}/set/{key}/{encoded}",
+        headers={"Authorization": f"Bearer {REDIS_TOKEN}"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+
+
+def get_users():
+    raw = redis_get(USERS_KEY)
+    if raw is None:
+        redis_set(USERS_KEY, json.dumps(DEFAULT_USERS))
+        return dict(DEFAULT_USERS)
+    return json.loads(raw)
+
+
+def save_users(users):
+    redis_set(USERS_KEY, json.dumps(users))
+
+
+# ---- Letterboxd / digest logic ------------------------------------------
 
 
 def stars_from_rating(rating):
@@ -97,8 +147,9 @@ def format_entry(entry):
 
 
 def build_message(since):
+    users = get_users()
     blocks = []
-    for display_name, username in USERS.items():
+    for display_name, username in users.items():
         entries = fetch_new_entries(username, since)
         if not entries:
             continue
@@ -160,6 +211,65 @@ def is_update_command(text):
     return False
 
 
+# ---- user-management commands --------------------------------------------
+
+HELP_TEXT = (
+    "<b>Comandi disponibili</b>\n"
+    "/update - manda subito il riepilogo\n"
+    "/lista - mostra gli utenti monitorati\n"
+    "/aggiungi Nome Cognome usernameletterboxd - aggiungi un utente\n"
+    "/rimuovi usernameletterboxd - rimuovi un utente\n"
+    "/help - mostra questo messaggio"
+)
+
+
+def handle_command(text):
+    """Returns a reply string if this text was a recognized management
+    command, otherwise None (so the caller can fall through to other
+    handling, e.g. is_update_command)."""
+    if not text:
+        return None
+    stripped = text.strip()
+    lower = stripped.lower()
+
+    if lower.startswith("/help"):
+        return HELP_TEXT
+
+    if lower.startswith("/lista"):
+        users = get_users()
+        if not users:
+            return "Nessun utente configurato."
+        lines = [f"- {html.escape(name)} → {html.escape(uname)}" for name, uname in users.items()]
+        return "<b>Utenti monitorati:</b>\n" + "\n".join(lines)
+
+    if lower.startswith("/aggiungi"):
+        parts = stripped.split()
+        if len(parts) < 3:
+            return "Uso corretto: /aggiungi Nome Cognome usernameletterboxd"
+        username = parts[-1]
+        display_name = " ".join(parts[1:-1])
+        users = get_users()
+        users[display_name] = username
+        save_users(users)
+        return f"Aggiunto: {html.escape(display_name)} → {html.escape(username)}"
+
+    if lower.startswith("/rimuovi"):
+        parts = stripped.split()
+        if len(parts) != 2:
+            return "Uso corretto: /rimuovi usernameletterboxd"
+        target = parts[1].lower()
+        users = get_users()
+        to_delete = [name for name, uname in users.items() if uname.lower() == target]
+        if not to_delete:
+            return f"Nessun utente trovato con username '{html.escape(parts[1])}'"
+        for name in to_delete:
+            del users[name]
+        save_users(users)
+        return f"Rimosso: {html.escape(', '.join(to_delete))}"
+
+    return None
+
+
 # ---- Vercel entrypoint -------------------------------------------------
 
 class handler(BaseHTTPRequestHandler):
@@ -174,11 +284,14 @@ class handler(BaseHTTPRequestHandler):
         message = update.get("message") or update.get("channel_post") or {}
         text = message.get("text", "")
 
-        if is_update_command(text):
-            try:
+        try:
+            reply = handle_command(text)
+            if reply:
+                send_telegram_message(reply)
+            elif is_update_command(text):
                 run_and_send_digest()
-            except Exception as exc:  # noqa: BLE001
-                print(f"[error] failed to send on-demand digest: {exc}", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[error] failed to handle message: {exc}", file=sys.stderr)
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
