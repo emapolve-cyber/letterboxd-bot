@@ -3,20 +3,18 @@ Vercel serverless function: Telegram webhook.
 File path in the repo must be: api/webhook.py
 
 Handles incoming Telegram updates:
-  - "/update" (or "@bot update")      -> sends the Letterboxd recap now,
-                                          only to the chat that asked
-  - "/aggiungi Nome Cognome username" -> adds a user to track (shared
-                                          across all groups)
-  - "/rimuovi username"               -> removes a tracked user
-  - "/lista"                          -> lists tracked users
+  - "/update" (or "@bot update")      -> sends this group's recap now
+  - "/aggiungi Nome Cognome username" -> adds a user to THIS group's list
+  - "/rimuovi username"               -> removes a user from THIS group
+  - "/lista"                          -> lists this group's tracked users
   - "/stop"                           -> stops the daily digest in this chat
   - "/help"                           -> shows available commands
 
 The bot can be added to any number of Telegram groups at the same time.
-The first time a recognized command is used in a group, that group is
-registered in Upstash Redis as an "active chat" and will start receiving
-the daily digest (api/cron.py) automatically. Use /stop to unregister a
-group. The tracked-user list is shared across all groups.
+Each group tracks its own independent list of Letterboxd users (stored in
+Upstash Redis, keyed by chat id). The first time a recognized command is
+used in a group, that group is registered as an "active chat" and starts
+receiving its own daily digest (api/cron.py). Use /stop to unregister.
 """
 
 import os
@@ -43,10 +41,12 @@ LOOKBACK_HOURS = float(os.environ.get("LOOKBACK_HOURS", "24"))
 
 REDIS_URL = os.environ["UPSTASH_REDIS_REST_URL"].rstrip("/")
 REDIS_TOKEN = os.environ["UPSTASH_REDIS_REST_TOKEN"]
-USERS_KEY = "letterboxd:users"
+USERS_KEY_PREFIX = "letterboxd:users:"
 ACTIVE_CHATS_KEY = "letterboxd:active_chats"
 
-# Seed list used only the very first time (when Redis has no data yet).
+# The very first group this bot was set up in - it keeps its original
+# 8-user list automatically. Any other, new group starts empty.
+ORIGINAL_CHAT_ID = "-5008110929"
 DEFAULT_USERS = {
     "andrea beni": "andreonbenon",
     "Lorenzo Sartor": "lorenzosartor",
@@ -81,16 +81,24 @@ def redis_set(key, value):
     resp.raise_for_status()
 
 
-def get_users():
-    raw = redis_get(USERS_KEY)
-    if raw is None:
-        redis_set(USERS_KEY, json.dumps(DEFAULT_USERS))
-        return dict(DEFAULT_USERS)
-    return json.loads(raw)
+def get_users(chat_id):
+    key = f"{USERS_KEY_PREFIX}{chat_id}"
+    raw = redis_get(key)
+    if raw is not None:
+        return json.loads(raw)
+
+    # First time we see this chat: seed it.
+    if str(chat_id) == ORIGINAL_CHAT_ID:
+        seed = dict(DEFAULT_USERS)
+    else:
+        seed = {}
+    redis_set(key, json.dumps(seed))
+    return seed
 
 
-def save_users(users):
-    redis_set(USERS_KEY, json.dumps(users))
+def save_users(chat_id, users):
+    key = f"{USERS_KEY_PREFIX}{chat_id}"
+    redis_set(key, json.dumps(users))
 
 
 def get_active_chats():
@@ -184,8 +192,8 @@ def format_entry(entry):
     return line
 
 
-def build_message(since):
-    users = get_users()
+def build_message(since, chat_id):
+    users = get_users(chat_id)
     blocks = []
     for display_name, username in users.items():
         entries = fetch_new_entries(username, since)
@@ -205,163 +213,3 @@ def build_message(since):
         return [full_text]
 
     chunks = []
-    current = header
-    for block in blocks:
-        if len(current) + len(block) + 2 > MAX_MESSAGE_LEN:
-            chunks.append(current)
-            current = ""
-        current += block + "\n\n"
-    if current.strip():
-        chunks.append(current)
-    return chunks
-
-
-def send_telegram_message(chat_id, text):
-    resp = requests.post(
-        TELEGRAM_API.format(token=TOKEN),
-        data={
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
-        timeout=30,
-    )
-    if not resp.ok:
-        print(f"[error] Telegram API error {resp.status_code}: {resp.text}", file=sys.stderr)
-        resp.raise_for_status()
-
-
-def run_and_send_digest(chat_id):
-    since = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
-    for msg in build_message(since):
-        send_telegram_message(chat_id, msg)
-
-
-def is_update_command(text):
-    if not text:
-        return False
-    text = text.strip().lower()
-    if text.startswith("/update"):
-        return True
-    if BOT_USERNAME and f"@{BOT_USERNAME}" in text and "update" in text:
-        return True
-    return False
-
-
-def is_stop_command(text):
-    if not text:
-        return False
-    return text.strip().lower().startswith("/stop")
-
-
-# ---- user-management commands --------------------------------------------
-
-HELP_TEXT = (
-    "<b>Comandi disponibili</b>\n"
-    "/update - manda subito il riepilogo in questo gruppo\n"
-    "/lista - mostra gli utenti monitorati\n"
-    "/aggiungi Nome Cognome usernameletterboxd - aggiungi un utente\n"
-    "/rimuovi usernameletterboxd - rimuovi un utente\n"
-    "/stop - disattiva il digest giornaliero in questo gruppo\n"
-    "/help - mostra questo messaggio\n\n"
-    "Il bot può stare in più gruppi contemporaneamente: usare un comando "
-    "in un gruppo lo attiva automaticamente per il digest giornaliero."
-)
-
-
-def handle_command(text):
-    """Returns a reply string if this text was a recognized management
-    command, otherwise None (so the caller can fall through to other
-    handling, e.g. is_update_command / is_stop_command)."""
-    if not text:
-        return None
-    stripped = text.strip()
-    lower = stripped.lower()
-
-    if lower.startswith("/help"):
-        return HELP_TEXT
-
-    if lower.startswith("/lista"):
-        users = get_users()
-        if not users:
-            return "Nessun utente configurato."
-        lines = [f"- {html.escape(name)} → {html.escape(uname)}" for name, uname in users.items()]
-        return "<b>Utenti monitorati:</b>\n" + "\n".join(lines)
-
-    if lower.startswith("/aggiungi"):
-        parts = stripped.split()
-        if len(parts) < 3:
-            return "Uso corretto: /aggiungi Nome Cognome usernameletterboxd"
-        username = parts[-1]
-        display_name = " ".join(parts[1:-1])
-        users = get_users()
-        users[display_name] = username
-        save_users(users)
-        return f"Aggiunto: {html.escape(display_name)} → {html.escape(username)}"
-
-    if lower.startswith("/rimuovi"):
-        parts = stripped.split()
-        if len(parts) != 2:
-            return "Uso corretto: /rimuovi usernameletterboxd"
-        target = parts[1].lower()
-        users = get_users()
-        to_delete = [name for name, uname in users.items() if uname.lower() == target]
-        if not to_delete:
-            return f"Nessun utente trovato con username '{html.escape(parts[1])}'"
-        for name in to_delete:
-            del users[name]
-        save_users(users)
-        return f"Rimosso: {html.escape(', '.join(to_delete))}"
-
-    return None
-
-
-# ---- Vercel entrypoint -------------------------------------------------
-
-class handler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        body = self.rfile.read(length) if length else b"{}"
-        try:
-            update = json.loads(body or b"{}")
-        except json.JSONDecodeError:
-            update = {}
-
-        message = update.get("message") or update.get("channel_post") or {}
-        text = message.get("text", "")
-        chat = message.get("chat") or {}
-        chat_id = chat.get("id")
-
-        try:
-            if chat_id is None:
-                pass
-            elif is_stop_command(text):
-                remove_active_chat(chat_id)
-                send_telegram_message(
-                    chat_id,
-                    "Digest giornaliero disattivato in questo gruppo. "
-                    "Gli altri comandi restano comunque disponibili.",
-                )
-            else:
-                reply = handle_command(text)
-                if reply is not None:
-                    add_active_chat(chat_id)
-                    send_telegram_message(chat_id, reply)
-                elif is_update_command(text):
-                    add_active_chat(chat_id)
-                    run_and_send_digest(chat_id)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[error] failed to handle message: {exc}", file=sys.stderr)
-
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(b'{"ok": true}')
-
-    def do_GET(self):
-        # simple health check
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"webhook alive")
