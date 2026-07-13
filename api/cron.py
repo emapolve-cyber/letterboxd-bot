@@ -3,11 +3,13 @@ Vercel serverless function: daily digest cron.
 File path in the repo must be: api/cron.py
 
 Triggered automatically once a day by Vercel Cron Jobs (see vercel.json).
-Sends the Letterboxd recap of the last LOOKBACK_HOURS hours to the chat.
+Sends the Letterboxd recap of the last LOOKBACK_HOURS hours to every
+"active chat" - every Telegram group where a bot command has been used
+(see api/webhook.py). Groups are added automatically the first time a
+command is used there, and removed with /stop.
 
-The list of tracked users is read from Upstash Redis (shared with
-api/webhook.py, which is where users get added/removed via Telegram
-commands).
+Falls back to the TELEGRAM_CHAT_ID env var if no active chat has been
+recorded yet (e.g. right after first deploy).
 """
 
 import os
@@ -27,12 +29,13 @@ TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 MAX_MESSAGE_LEN = 4000
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+FALLBACK_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 LOOKBACK_HOURS = float(os.environ.get("LOOKBACK_HOURS", "24"))
 
 REDIS_URL = os.environ["UPSTASH_REDIS_REST_URL"].rstrip("/")
 REDIS_TOKEN = os.environ["UPSTASH_REDIS_REST_TOKEN"]
 USERS_KEY = "letterboxd:users"
+ACTIVE_CHATS_KEY = "letterboxd:active_chats"
 
 DEFAULT_USERS = {
     "andrea beni": "andreonbenon",
@@ -72,6 +75,19 @@ def get_users():
         redis_set(USERS_KEY, json.dumps(DEFAULT_USERS))
         return dict(DEFAULT_USERS)
     return json.loads(raw)
+
+
+def get_active_chats():
+    raw = redis_get(ACTIVE_CHATS_KEY)
+    chats = []
+    if raw:
+        try:
+            chats = json.loads(raw)
+        except json.JSONDecodeError:
+            chats = []
+    if not chats and FALLBACK_CHAT_ID:
+        chats = [FALLBACK_CHAT_ID]
+    return chats
 
 
 def stars_from_rating(rating):
@@ -162,32 +178,8 @@ def build_message(since):
     return chunks
 
 
-def send_telegram_message(text):
+def send_telegram_message(chat_id, text):
     resp = requests.post(
         TELEGRAM_API.format(token=TOKEN),
         data={
-            "chat_id": CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
-        timeout=30,
-    )
-    if not resp.ok:
-        print(f"[error] Telegram API error {resp.status_code}: {resp.text}", file=sys.stderr)
-        resp.raise_for_status()
-
-
-class handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        since = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
-        try:
-            for msg in build_message(since):
-                send_telegram_message(msg)
-            ok = True
-        except Exception as exc:  # noqa: BLE001
-            print(f"[error] daily digest failed: {exc}", file=sys.stderr)
-            ok = False
-
-        self.send_response(200 if ok else 500)
-        self.send_header("Content-Type",
+            "chat_id":
