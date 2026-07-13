@@ -213,3 +213,162 @@ def build_message(since, chat_id):
         return [full_text]
 
     chunks = []
+    current = header
+    for block in blocks:
+        if len(current) + len(block) + 2 > MAX_MESSAGE_LEN:
+            chunks.append(current)
+            current = ""
+        current += block + "\n\n"
+    if current.strip():
+        chunks.append(current)
+    return chunks
+
+
+def send_telegram_message(chat_id, text):
+    resp = requests.post(
+        TELEGRAM_API.format(token=TOKEN),
+        data={
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+        timeout=30,
+    )
+    if not resp.ok:
+        print(f"[error] Telegram API error {resp.status_code}: {resp.text}", file=sys.stderr)
+        resp.raise_for_status()
+
+
+def run_and_send_digest(chat_id):
+    since = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
+    for msg in build_message(since, chat_id):
+        send_telegram_message(chat_id, msg)
+
+
+def is_update_command(text):
+    if not text:
+        return False
+    text = text.strip().lower()
+    if text.startswith("/update"):
+        return True
+    if BOT_USERNAME and f"@{BOT_USERNAME}" in text and "update" in text:
+        return True
+    return False
+
+
+def is_stop_command(text):
+    if not text:
+        return False
+    return text.strip().lower().startswith("/stop")
+
+
+# ---- user-management commands --------------------------------------------
+
+HELP_TEXT = (
+    "<b>Comandi disponibili</b>\n"
+    "/update - manda subito il riepilogo di questo gruppo\n"
+    "/lista - mostra gli utenti monitorati in questo gruppo\n"
+    "/aggiungi Nome Cognome usernameletterboxd - aggiungi un utente a questo gruppo\n"
+    "/rimuovi usernameletterboxd - rimuovi un utente da questo gruppo\n"
+    "/stop - disattiva il digest giornaliero in questo gruppo\n"
+    "/help - mostra questo messaggio\n\n"
+    "Ogni gruppo ha la propria lista di utenti Letterboxd, indipendente dagli altri."
+)
+
+
+def handle_command(text, chat_id):
+    """Returns a reply string if this text was a recognized management
+    command, otherwise None (so the caller can fall through to other
+    handling, e.g. is_update_command / is_stop_command)."""
+    if not text:
+        return None
+    stripped = text.strip()
+    lower = stripped.lower()
+
+    if lower.startswith("/help"):
+        return HELP_TEXT
+
+    if lower.startswith("/lista"):
+        users = get_users(chat_id)
+        if not users:
+            return "Nessun utente configurato in questo gruppo. Usa /aggiungi per iniziare."
+        lines = [f"- {html.escape(name)} → {html.escape(uname)}" for name, uname in users.items()]
+        return "<b>Utenti monitorati in questo gruppo:</b>\n" + "\n".join(lines)
+
+    if lower.startswith("/aggiungi"):
+        parts = stripped.split()
+        if len(parts) < 3:
+            return "Uso corretto: /aggiungi Nome Cognome usernameletterboxd"
+        username = parts[-1]
+        display_name = " ".join(parts[1:-1])
+        users = get_users(chat_id)
+        users[display_name] = username
+        save_users(chat_id, users)
+        return f"Aggiunto a questo gruppo: {html.escape(display_name)} → {html.escape(username)}"
+
+    if lower.startswith("/rimuovi"):
+        parts = stripped.split()
+        if len(parts) != 2:
+            return "Uso corretto: /rimuovi usernameletterboxd"
+        target = parts[1].lower()
+        users = get_users(chat_id)
+        to_delete = [name for name, uname in users.items() if uname.lower() == target]
+        if not to_delete:
+            return f"Nessun utente trovato con username '{html.escape(parts[1])}' in questo gruppo"
+        for name in to_delete:
+            del users[name]
+        save_users(chat_id, users)
+        return f"Rimosso da questo gruppo: {html.escape(', '.join(to_delete))}"
+
+    return None
+
+
+# ---- Vercel entrypoint -------------------------------------------------
+
+class handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        body = self.rfile.read(length) if length else b"{}"
+        try:
+            update = json.loads(body or b"{}")
+        except json.JSONDecodeError:
+            update = {}
+
+        message = update.get("message") or update.get("channel_post") or {}
+        text = message.get("text", "")
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
+
+        try:
+            if chat_id is None:
+                pass
+            elif is_stop_command(text):
+                remove_active_chat(chat_id)
+                send_telegram_message(
+                    chat_id,
+                    "Digest giornaliero disattivato in questo gruppo. "
+                    "Gli altri comandi restano comunque disponibili.",
+                )
+            else:
+                reply = handle_command(text, chat_id)
+                if reply is not None:
+                    add_active_chat(chat_id)
+                    send_telegram_message(chat_id, reply)
+                elif is_update_command(text):
+                    add_active_chat(chat_id)
+                    run_and_send_digest(chat_id)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[error] failed to handle message: {exc}", file=sys.stderr)
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"ok": true}')
+
+    def do_GET(self):
+        # simple health check
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"webhook alive")
