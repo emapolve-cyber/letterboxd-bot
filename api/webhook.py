@@ -15,6 +15,9 @@ Each group tracks its own independent list of Letterboxd users (stored in
 Upstash Redis, keyed by chat id). The first time a recognized command is
 used in a group, that group is registered as an "active chat" and starts
 receiving its own daily digest (api/cron.py). Use /stop to unregister.
+
+If TMDB_API_KEY is configured, the digest also sends a photo album with
+movie posters (via TMDB) before the text recap.
 """
 
 import os
@@ -33,11 +36,18 @@ import requests
 
 RSS_URL = "https://letterboxd.com/{username}/rss/"
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
+TELEGRAM_PHOTO_API = "https://api.telegram.org/bot{token}/sendPhoto"
+TELEGRAM_MEDIA_GROUP_API = "https://api.telegram.org/bot{token}/sendMediaGroup"
 MAX_MESSAGE_LEN = 4000
+MAX_ALBUM_SIZE = 10
+
+TMDB_SEARCH_URL = "https://api.themoviedb.org/3/search/movie"
+TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w500"
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 BOT_USERNAME = os.environ.get("TELEGRAM_BOT_USERNAME", "").lstrip("@").lower()
 LOOKBACK_HOURS = float(os.environ.get("LOOKBACK_HOURS", "24"))
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
 
 REDIS_URL = os.environ["UPSTASH_REDIS_REST_URL"].rstrip("/")
 REDIS_TOKEN = os.environ["UPSTASH_REDIS_REST_TOKEN"]
@@ -87,7 +97,6 @@ def get_users(chat_id):
     if raw is not None:
         return json.loads(raw)
 
-    # First time we see this chat: seed it.
     if str(chat_id) == ORIGINAL_CHAT_ID:
         seed = dict(DEFAULT_USERS)
     else:
@@ -133,7 +142,7 @@ def remove_active_chat(chat_id):
         print(f"[warn] failed to unregister active chat: {exc}", file=sys.stderr)
 
 
-# ---- Letterboxd / digest logic ------------------------------------------
+# ---- Letterboxd feed logic ------------------------------------------
 
 
 def stars_from_rating(rating):
@@ -167,6 +176,16 @@ def fetch_new_entries(username, since):
     return new_entries
 
 
+def collect_entries(chat_id, since):
+    """Returns a list of (display_name, entry) tuples, oldest first."""
+    users = get_users(chat_id)
+    collected = []
+    for display_name, username in users.items():
+        for entry in fetch_new_entries(username, since):
+            collected.append((display_name, entry))
+    return collected
+
+
 def format_entry(entry):
     film_title = entry.get("letterboxd_filmtitle")
     film_year = entry.get("letterboxd_filmyear")
@@ -192,21 +211,24 @@ def format_entry(entry):
     return line
 
 
-def build_message(since, chat_id):
-    users = get_users(chat_id)
+def build_text_messages(collected, header_text):
+    if not collected:
+        return ["Nessuna attività Letterboxd nel periodo richiesto."]
+
+    seen_order = []
+    grouped = {}
+    for display_name, entry in collected:
+        grouped.setdefault(display_name, []).append(entry)
+        if display_name not in seen_order:
+            seen_order.append(display_name)
+
     blocks = []
-    for display_name, username in users.items():
-        entries = fetch_new_entries(username, since)
-        if not entries:
-            continue
-        lines = [format_entry(e) for e in entries]
+    for display_name in seen_order:
+        lines = [format_entry(e) for e in grouped[display_name]]
         block = f"<b>{html.escape(display_name)}</b>\n" + "\n".join(lines)
         blocks.append(block)
 
-    if not blocks:
-        return ["Nessuna attività Letterboxd nel periodo richiesto."]
-
-    header = "\U0001f3a5 <b>Letterboxd - riepilogo</b>\n\n"
+    header = f"\U0001f3a5 <b>{html.escape(header_text)}</b>\n\n"
     full_text = header + "\n\n".join(blocks)
 
     if len(full_text) <= MAX_MESSAGE_LEN:
@@ -222,6 +244,47 @@ def build_message(since, chat_id):
     if current.strip():
         chunks.append(current)
     return chunks
+
+
+# ---- TMDB poster lookup ---------------------------------------------
+
+
+def tmdb_poster_url(title, year):
+    if not TMDB_API_KEY:
+        return None
+    try:
+        params = {"api_key": TMDB_API_KEY, "query": title}
+        if year:
+            params["year"] = year
+        resp = requests.get(TMDB_SEARCH_URL, params=params, timeout=10)
+        resp.raise_for_status()
+        results = resp.json().get("results") or []
+        if not results:
+            return None
+        poster_path = results[0].get("poster_path")
+        if not poster_path:
+            return None
+        return TMDB_IMAGE_BASE + poster_path
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warn] TMDB lookup failed for '{title}': {exc}", file=sys.stderr)
+        return None
+
+
+def collect_poster_urls(collected, limit=MAX_ALBUM_SIZE):
+    urls = []
+    for _display_name, entry in collected:
+        if len(urls) >= limit:
+            break
+        film_title = entry.get("letterboxd_filmtitle")
+        if not film_title:
+            continue
+        poster = tmdb_poster_url(film_title, entry.get("letterboxd_filmyear"))
+        if poster:
+            urls.append(poster)
+    return urls
+
+
+# ---- Telegram sending -------------------------------------------------
 
 
 def send_telegram_message(chat_id, text):
@@ -240,9 +303,38 @@ def send_telegram_message(chat_id, text):
         resp.raise_for_status()
 
 
-def run_and_send_digest(chat_id):
+def send_photo_album(chat_id, urls):
+    if not urls:
+        return
+    try:
+        if len(urls) == 1:
+            resp = requests.post(
+                TELEGRAM_PHOTO_API.format(token=TOKEN),
+                data={"chat_id": chat_id, "photo": urls[0]},
+                timeout=30,
+            )
+        else:
+            media = [{"type": "photo", "media": u} for u in urls[:MAX_ALBUM_SIZE]]
+            resp = requests.post(
+                TELEGRAM_MEDIA_GROUP_API.format(token=TOKEN),
+                data={"chat_id": chat_id, "media": json.dumps(media)},
+                timeout=30,
+            )
+        if not resp.ok:
+            print(f"[warn] failed to send poster album: {resp.status_code} {resp.text}", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warn] failed to send poster album: {exc}", file=sys.stderr)
+
+
+def run_and_send_digest(chat_id, header_text="Letterboxd - riepilogo"):
     since = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
-    for msg in build_message(since, chat_id):
+    collected = collect_entries(chat_id, since)
+
+    poster_urls = collect_poster_urls(collected)
+    if poster_urls:
+        send_photo_album(chat_id, poster_urls)
+
+    for msg in build_text_messages(collected, header_text):
         send_telegram_message(chat_id, msg)
 
 
@@ -357,7 +449,7 @@ class handler(BaseHTTPRequestHandler):
                     send_telegram_message(chat_id, reply)
                 elif is_update_command(text):
                     add_active_chat(chat_id)
-                    run_and_send_digest(chat_id)
+                    run_and_send_digest(chat_id, header_text="Letterboxd - riepilogo")
         except Exception as exc:  # noqa: BLE001
             print(f"[error] failed to handle message: {exc}", file=sys.stderr)
 
