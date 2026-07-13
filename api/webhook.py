@@ -3,14 +3,20 @@ Vercel serverless function: Telegram webhook.
 File path in the repo must be: api/webhook.py
 
 Handles incoming Telegram updates:
-  - "/update" (or "@bot update")      -> sends the Letterboxd recap now
-  - "/aggiungi Nome Cognome username" -> adds a user to track
+  - "/update" (or "@bot update")      -> sends the Letterboxd recap now,
+                                          only to the chat that asked
+  - "/aggiungi Nome Cognome username" -> adds a user to track (shared
+                                          across all groups)
   - "/rimuovi username"               -> removes a tracked user
   - "/lista"                          -> lists tracked users
+  - "/stop"                           -> stops the daily digest in this chat
   - "/help"                           -> shows available commands
 
-The list of tracked users is stored in Upstash Redis (free tier, no card)
-so it survives across deploys and can be edited from Telegram directly.
+The bot can be added to any number of Telegram groups at the same time.
+The first time a recognized command is used in a group, that group is
+registered in Upstash Redis as an "active chat" and will start receiving
+the daily digest (api/cron.py) automatically. Use /stop to unregister a
+group. The tracked-user list is shared across all groups.
 """
 
 import os
@@ -32,13 +38,13 @@ TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 MAX_MESSAGE_LEN = 4000
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 BOT_USERNAME = os.environ.get("TELEGRAM_BOT_USERNAME", "").lstrip("@").lower()
 LOOKBACK_HOURS = float(os.environ.get("LOOKBACK_HOURS", "24"))
 
 REDIS_URL = os.environ["UPSTASH_REDIS_REST_URL"].rstrip("/")
 REDIS_TOKEN = os.environ["UPSTASH_REDIS_REST_TOKEN"]
 USERS_KEY = "letterboxd:users"
+ACTIVE_CHATS_KEY = "letterboxd:active_chats"
 
 # Seed list used only the very first time (when Redis has no data yet).
 DEFAULT_USERS = {
@@ -85,6 +91,38 @@ def get_users():
 
 def save_users(users):
     redis_set(USERS_KEY, json.dumps(users))
+
+
+def get_active_chats():
+    raw = redis_get(ACTIVE_CHATS_KEY)
+    if not raw:
+        return []
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+
+
+def add_active_chat(chat_id):
+    try:
+        chats = get_active_chats()
+        cid = str(chat_id)
+        if cid not in chats:
+            chats.append(cid)
+            redis_set(ACTIVE_CHATS_KEY, json.dumps(chats))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warn] failed to register active chat: {exc}", file=sys.stderr)
+
+
+def remove_active_chat(chat_id):
+    try:
+        chats = get_active_chats()
+        cid = str(chat_id)
+        if cid in chats:
+            chats.remove(cid)
+            redis_set(ACTIVE_CHATS_KEY, json.dumps(chats))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warn] failed to unregister active chat: {exc}", file=sys.stderr)
 
 
 # ---- Letterboxd / digest logic ------------------------------------------
@@ -178,11 +216,11 @@ def build_message(since):
     return chunks
 
 
-def send_telegram_message(text):
+def send_telegram_message(chat_id, text):
     resp = requests.post(
         TELEGRAM_API.format(token=TOKEN),
         data={
-            "chat_id": CHAT_ID,
+            "chat_id": chat_id,
             "text": text,
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
@@ -194,10 +232,10 @@ def send_telegram_message(text):
         resp.raise_for_status()
 
 
-def run_and_send_digest():
+def run_and_send_digest(chat_id):
     since = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
     for msg in build_message(since):
-        send_telegram_message(msg)
+        send_telegram_message(chat_id, msg)
 
 
 def is_update_command(text):
@@ -211,22 +249,31 @@ def is_update_command(text):
     return False
 
 
+def is_stop_command(text):
+    if not text:
+        return False
+    return text.strip().lower().startswith("/stop")
+
+
 # ---- user-management commands --------------------------------------------
 
 HELP_TEXT = (
     "<b>Comandi disponibili</b>\n"
-    "/update - manda subito il riepilogo\n"
+    "/update - manda subito il riepilogo in questo gruppo\n"
     "/lista - mostra gli utenti monitorati\n"
     "/aggiungi Nome Cognome usernameletterboxd - aggiungi un utente\n"
     "/rimuovi usernameletterboxd - rimuovi un utente\n"
-    "/help - mostra questo messaggio"
+    "/stop - disattiva il digest giornaliero in questo gruppo\n"
+    "/help - mostra questo messaggio\n\n"
+    "Il bot può stare in più gruppi contemporaneamente: usare un comando "
+    "in un gruppo lo attiva automaticamente per il digest giornaliero."
 )
 
 
 def handle_command(text):
     """Returns a reply string if this text was a recognized management
     command, otherwise None (so the caller can fall through to other
-    handling, e.g. is_update_command)."""
+    handling, e.g. is_update_command / is_stop_command)."""
     if not text:
         return None
     stripped = text.strip()
@@ -283,13 +330,27 @@ class handler(BaseHTTPRequestHandler):
 
         message = update.get("message") or update.get("channel_post") or {}
         text = message.get("text", "")
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
 
         try:
-            reply = handle_command(text)
-            if reply:
-                send_telegram_message(reply)
-            elif is_update_command(text):
-                run_and_send_digest()
+            if chat_id is None:
+                pass
+            elif is_stop_command(text):
+                remove_active_chat(chat_id)
+                send_telegram_message(
+                    chat_id,
+                    "Digest giornaliero disattivato in questo gruppo. "
+                    "Gli altri comandi restano comunque disponibili.",
+                )
+            else:
+                reply = handle_command(text)
+                if reply is not None:
+                    add_active_chat(chat_id)
+                    send_telegram_message(chat_id, reply)
+                elif is_update_command(text):
+                    add_active_chat(chat_id)
+                    run_and_send_digest(chat_id)
         except Exception as exc:  # noqa: BLE001
             print(f"[error] failed to handle message: {exc}", file=sys.stderr)
 
