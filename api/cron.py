@@ -4,19 +4,37 @@ File path in the repo must be: api/cron.py
 
 Triggered automatically once a day by Vercel Cron Jobs (see vercel.json).
 Sends the Letterboxd recap of the last LOOKBACK_HOURS hours to the chat.
+
+The list of tracked users is read from Upstash Redis (shared with
+api/webhook.py, which is where users get added/removed via Telegram
+commands).
 """
 
 import os
 import sys
+import json
 import html
 import time
+from urllib.parse import quote
 from http.server import BaseHTTPRequestHandler
 from datetime import datetime, timezone, timedelta
 
 import feedparser
 import requests
 
-USERS = {
+RSS_URL = "https://letterboxd.com/{username}/rss/"
+TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
+MAX_MESSAGE_LEN = 4000
+
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+LOOKBACK_HOURS = float(os.environ.get("LOOKBACK_HOURS", "24"))
+
+REDIS_URL = os.environ["UPSTASH_REDIS_REST_URL"].rstrip("/")
+REDIS_TOKEN = os.environ["UPSTASH_REDIS_REST_TOKEN"]
+USERS_KEY = "letterboxd:users"
+
+DEFAULT_USERS = {
     "andrea beni": "andreonbenon",
     "Lorenzo Sartor": "lorenzosartor",
     "Davide Colli": "david_hills",
@@ -27,13 +45,33 @@ USERS = {
     "Emanuele Polverino": "EmaPolve",
 }
 
-RSS_URL = "https://letterboxd.com/{username}/rss/"
-TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
-MAX_MESSAGE_LEN = 4000
 
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-LOOKBACK_HOURS = float(os.environ.get("LOOKBACK_HOURS", "24"))
+def redis_get(key):
+    resp = requests.get(
+        f"{REDIS_URL}/get/{key}",
+        headers={"Authorization": f"Bearer {REDIS_TOKEN}"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json().get("result")
+
+
+def redis_set(key, value):
+    encoded = quote(value, safe="")
+    resp = requests.post(
+        f"{REDIS_URL}/set/{key}/{encoded}",
+        headers={"Authorization": f"Bearer {REDIS_TOKEN}"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+
+
+def get_users():
+    raw = redis_get(USERS_KEY)
+    if raw is None:
+        redis_set(USERS_KEY, json.dumps(DEFAULT_USERS))
+        return dict(DEFAULT_USERS)
+    return json.loads(raw)
 
 
 def stars_from_rating(rating):
@@ -93,8 +131,9 @@ def format_entry(entry):
 
 
 def build_message(since):
+    users = get_users()
     blocks = []
-    for display_name, username in USERS.items():
+    for display_name, username in users.items():
         entries = fetch_new_entries(username, since)
         if not entries:
             continue
@@ -151,6 +190,4 @@ class handler(BaseHTTPRequestHandler):
             ok = False
 
         self.send_response(200 if ok else 500)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(b'{"ok": true}' if ok else b'{"ok": false}')
+        self.send_header("Content-Type",
