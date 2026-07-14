@@ -289,6 +289,12 @@ def build_text_messages(collected, header_text):
 
 
 def build_weekly_report_text(collected):
+    # Only count actual watched films. The RSS feed also contains other
+    # activity (e.g. ranked list updates like "Il mio Miyazaki"), which
+    # has no letterboxd:filmTitle and isn't a watched film - it shouldn't
+    # be counted towards "film visti questa settimana".
+    collected = [(name, entry) for name, entry in collected if entry.get("letterboxd_filmtitle")]
+
     if not collected:
         return "\U0001f4ca <b>Report settimanale</b>\n\nNessuna attività Letterboxd negli ultimi 7 giorni."
 
@@ -501,49 +507,6 @@ def handle_command(text, chat_id):
         users[display_name] = username
         save_users(chat_id, users)
         return f"Aggiunto a questo gruppo: {html.escape(display_name)} → {html.escape(username)}"
-
-    if lower.startswith("/debugtop"):
-        parts = stripped.split()
-        if len(parts) != 2:
-            return "Uso corretto: /debugtop usernameletterboxd"
-        username = parts[1]
-        since = datetime.now(timezone.utc) - timedelta(hours=WEEKLY_LOOKBACK_HOURS)
-        entries = fetch_new_entries(username, since)
-        lines = [
-            f"<b>Debugtop:</b> {html.escape(username)}",
-            f"WEEKLY_LOOKBACK_HOURS={WEEKLY_LOOKBACK_HOURS}",
-            f"since={since.isoformat()}",
-            f"entries trovate (dopo filtro+dedup): {len(entries)}\n",
-        ]
-        for entry in entries:
-            title = entry.get("letterboxd_filmtitle") or entry.get("title", "?")
-            watched = entry.get("letterboxd_watcheddate", "MANCANTE")
-            lines.append(f"- {html.escape(str(title))} | watched={html.escape(str(watched))}")
-        return "\n".join(lines)
-
-    if lower.startswith("/debug"):
-        parts = stripped.split()
-        if len(parts) != 2:
-            return "Uso corretto: /debug usernameletterboxd"
-        username = parts[1]
-        feed = feedparser.parse(RSS_URL.format(username=username))
-        if feed.bozo and not feed.entries:
-            return f"Errore lettura feed per {html.escape(username)}: {html.escape(str(feed.bozo_exception))}"
-        now = datetime.now(timezone.utc)
-        lines = [
-            f"<b>Debug feed:</b> {html.escape(username)} ({len(feed.entries)} voci totali nel feed)",
-            f"Ora server (UTC): {html.escape(now.isoformat())}\n",
-        ]
-        for entry in feed.entries[:20]:
-            title = entry.get("letterboxd_filmtitle") or entry.get("title", "?")
-            watched = entry.get("letterboxd_watcheddate", "MANCANTE")
-            pub = entry.get("published", "MANCANTE")
-            computed = _entry_date_utc(entry)
-            lines.append(
-                f"- {html.escape(str(title))} | watched={html.escape(str(watched))} | "
-                f"pub={html.escape(str(pub))} | computed_utc={computed}"
-            )
-        return "\n".join(lines)
 
     if lower.startswith("/rimuovi"):
         parts = stripped.split()
