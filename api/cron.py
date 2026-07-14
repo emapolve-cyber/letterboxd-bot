@@ -186,9 +186,11 @@ def format_entry(entry):
     film_year = entry.get("letterboxd_filmyear")
     rating = entry.get("letterboxd_memberrating")
     rewatch = entry.get("letterboxd_rewatch") == "Yes"
+    liked = entry.get("letterboxd_memberlike") == "Yes"
     link = entry.get("link", "")
 
     stars = stars_from_rating(rating)
+    heart = " ❤️" if liked else ""
     rewatch_icon = " \U0001f501" if rewatch else ""
 
     if film_title:
@@ -198,6 +200,7 @@ def format_entry(entry):
         line = f"\U0001f3ac <a href=\"{html.escape(link)}\">{title_part}</a>"
         if stars:
             line += f" {stars}"
+        line += heart
         line += rewatch_icon
     else:
         title_part = html.escape(entry.get("title", "Nuovo contenuto"))
