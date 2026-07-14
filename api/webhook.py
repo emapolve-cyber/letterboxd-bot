@@ -30,6 +30,7 @@ import json
 import html
 import time
 import calendar
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote
 from http.server import BaseHTTPRequestHandler
 from datetime import datetime, timezone, timedelta
@@ -48,7 +49,9 @@ MAX_ALBUM_SIZE = 10
 WEEKLY_LOOKBACK_HOURS = 24 * 7
 
 TMDB_SEARCH_URL = "https://api.themoviedb.org/3/search/movie"
+TMDB_DISCOVER_URL = "https://api.themoviedb.org/3/discover/movie"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w500"
+ANNIVERSARY_YEARS = tuple(range(5, 101, 5))  # 5, 10, 15, ... 100
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 BOT_USERNAME = os.environ.get("TELEGRAM_BOT_USERNAME", "").lstrip("@").lower()
@@ -369,6 +372,27 @@ def build_weekly_report_text(collected):
 # ---- TMDB poster lookup ---------------------------------------------
 
 
+def tmdb_discover_releases_for_date(date_str):
+    """Releases matching an exact primary release date, or None on failure."""
+    try:
+        resp = requests.get(
+            TMDB_DISCOVER_URL,
+            params={
+                "api_key": TMDB_API_KEY,
+                "primary_release_date.gte": date_str,
+                "primary_release_date.lte": date_str,
+                "sort_by": "popularity.desc",
+                "page": 1,
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warn] TMDB discover failed for {date_str}: {exc}", file=sys.stderr)
+        return None
+
+
 def tmdb_poster_url(title, year):
     if not TMDB_API_KEY:
         return None
@@ -499,6 +523,7 @@ HELP_TEXT = (
     "/film titolo - mostra chi nel gruppo ha visto un film e con che voto\n"
     "/sfida nome1 nome2 [giorni] - confronta quanti film hanno visto due utenti (default 7 giorni)\n"
     "/stats - statistiche di gruppo (film totali, utente più attivo, voto medio, ecc.)\n"
+    "/uscite - quanti film sono usciti oggi da 5 a 100 anni fa, ogni 5 anni (TMDB)\n"
     "/stop - disattiva il digest giornaliero in questo gruppo\n"
     "/help - mostra questo messaggio\n\n"
     "Ogni gruppo ha la propria lista di utenti Letterboxd, indipendente dagli altri.\n"
@@ -647,6 +672,55 @@ def handle_command(text, chat_id):
             "",
             verdict,
         ])
+
+    if lower.startswith("/uscite"):
+        if not TMDB_API_KEY:
+            return "Comando non disponibile: TMDB_API_KEY non configurata."
+
+        today = datetime.now(timezone.utc).date()
+        targets = []
+        for years in ANNIVERSARY_YEARS:
+            try:
+                target_date = today.replace(year=today.year - years)
+            except ValueError:
+                # today is Feb 29 and the target year isn't a leap year
+                target_date = today.replace(year=today.year - years, day=28)
+            targets.append((years, target_date))
+
+        # One TMDB request per anniversary - with up to 20 of them (5 to
+        # 100 years, step 5), running them in parallel keeps this well
+        # within a serverless function's time budget instead of doing
+        # 20 sequential round-trips.
+        results_by_years = {}
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_map = {
+                executor.submit(tmdb_discover_releases_for_date, target_date.isoformat()): years
+                for years, target_date in targets
+            }
+            for future in as_completed(future_map):
+                results_by_years[future_map[future]] = future.result()
+
+        lines = [f"<b>\U0001f4c5 Uscite del {today.day:02d}/{today.month:02d} negli anni</b>\n"]
+        got_any = False
+        for years, target_date in targets:
+            data = results_by_years.get(years)
+            if data is None:
+                continue
+
+            got_any = True
+            total = data.get("total_results", 0)
+            top_titles = [r.get("title") for r in data.get("results", [])[:3] if r.get("title")]
+
+            line = f"<b>{years} anni fa</b> ({target_date.year}): {total} film"
+            if top_titles:
+                line += " — tra cui: " + ", ".join(html.escape(t) for t in top_titles)
+            lines.append(line)
+
+        if not got_any:
+            return "Non sono riuscito a recuperare i dati da TMDB al momento, riprova più tardi."
+
+        lines.append("\n<i>Dati: TMDB, in base alla data di uscita primaria registrata.</i>")
+        return "\n".join(lines)
 
     if lower.startswith("/stats"):
         users = get_users(chat_id)
