@@ -216,8 +216,9 @@ def build_weekly_report_text(collected):
             if film_year:
                 title_part += f" ({html.escape(str(film_year))})"
             stars = stars_from_rating(rating_value)
+            heart = " ❤️" if entry.get("letterboxd_memberlike") == "Yes" else ""
             lines.append(
-                f"{i}. <a href=\"{html.escape(link)}\">{title_part}</a> {stars} — {html.escape(display_name)}"
+                f"{i}. <a href=\"{html.escape(link)}\">{title_part}</a> {stars}{heart} — {html.escape(display_name)}"
             )
 
     return "\n".join(lines)
