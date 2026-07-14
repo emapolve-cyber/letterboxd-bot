@@ -596,29 +596,37 @@ def handle_command(text, chat_id):
         return "\n".join(lines)
 
     if lower.startswith("/sfida"):
-        parts = stripped.split()[1:]
-        if not parts:
+        tokens = stripped.split()[1:]
+        if not tokens:
             return "Uso corretto: /sfida nome1 nome2 [giorni] (nomi come in /lista, es. /sfida Fefo Arturo)"
+
         days = 7
-        if parts[-1].isdigit():
-            days = max(1, int(parts[-1]))
-            parts = parts[:-1]
-        if len(parts) != 2:
-            return "Uso corretto: /sfida nome1 nome2 [giorni] (nomi come in /lista, es. /sfida Fefo Arturo)"
+        if tokens[-1].isdigit():
+            days = max(1, int(tokens[-1]))
+            tokens = tokens[:-1]
 
         users = get_users(chat_id)
+        # Display names can contain spaces (e.g. "Lorenzo Sartor"), so we
+        # can't just split on whitespace into two names. Instead, try every
+        # way of splitting the remaining tokens into two groups and check
+        # both against the group's actual registered names.
+        names_lower = {name.lower(): name for name in users}
+        match = None
+        for i in range(1, len(tokens)):
+            name1 = " ".join(tokens[:i])
+            name2 = " ".join(tokens[i:])
+            if name1.lower() in names_lower and name2.lower() in names_lower:
+                match = (names_lower[name1.lower()], names_lower[name2.lower()])
+                break
 
-        def find_user(query):
-            for name, uname in users.items():
-                if name.lower() == query.lower():
-                    return name, uname
-            return None
+        if not match:
+            return (
+                "Non ho riconosciuto due nomi validi. Uso corretto: /sfida nome1 nome2 [giorni] "
+                "(nomi esatti come mostrati in /lista, es. /sfida Fefo Arturo)."
+            )
 
-        u1 = find_user(parts[0])
-        u2 = find_user(parts[1])
-        if not u1 or not u2:
-            missing = parts[0] if not u1 else parts[1]
-            return f"Utente '{html.escape(missing)}' non trovato in questo gruppo. Controlla /lista."
+        u1 = (match[0], users[match[0]])
+        u2 = (match[1], users[match[1]])
 
         since = datetime.now(timezone.utc) - timedelta(days=days)
         films1 = [e for e in fetch_new_entries(u1[1], since) if e.get("letterboxd_filmtitle")]
