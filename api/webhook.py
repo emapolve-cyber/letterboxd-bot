@@ -25,6 +25,7 @@ with movie posters (via TMDB) before the text recap.
 """
 
 import os
+import re
 import sys
 import json
 import html
@@ -36,6 +37,7 @@ from datetime import datetime, timezone, timedelta
 
 import feedparser
 import requests
+from bs4 import BeautifulSoup
 
 # ---- config -------------------------------------------------------------
 
@@ -234,6 +236,114 @@ def fetch_all_entries(username):
     See _parse_feed_entries: this is recent activity, not full history.
     """
     entries = _parse_feed_entries(username)
+    entries.reverse()
+    return entries
+
+
+# ---- Letterboxd diary scraping (year-scoped) -------------------------
+#
+# The RSS feed only exposes a user's most recent ~50-100 diary entries.
+# For commands that need a broader (but still bounded) view, we scrape
+# https://letterboxd.com/{username}/diary/films/for/{year}/ instead.
+# Scoping to a single year keeps this fast and reasonable (a handful of
+# pages per user) - scraping a user's *entire* history was tested and
+# ruled out: some users have 50+ pages of diary entries, which would be
+# far too slow and too aggressive towards Letterboxd's servers.
+#
+# Returned entries are plain dicts using the same keys as RSS entries
+# (letterboxd_filmtitle, letterboxd_filmyear, letterboxd_memberrating,
+# letterboxd_rewatch, letterboxd_memberlike, letterboxd_watcheddate,
+# link) so they can be passed into the exact same formatting helpers
+# (stars_from_rating, etc.) used elsewhere for RSS entries.
+
+DIARY_YEAR_URL = "https://letterboxd.com/{username}/diary/films/for/{year}/page/{page}/"
+DIARY_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+DIARY_MAX_PAGES = 8  # safety cap per user, per year
+
+
+def _parse_diary_row(row, username):
+    title_link = row.select_one("h2.primaryname a")
+    if not title_link:
+        return None
+    film_title = title_link.get_text(strip=True)
+
+    year_link = row.select_one("span.releasedate a")
+    film_year = year_link.get_text(strip=True) if year_link else None
+
+    href = title_link.get("href", "")
+    link = f"https://letterboxd.com{href}" if href.startswith("/") else href
+
+    day_link = row.select_one("td.col-daydate a.daydate")
+    watched_date = None
+    if day_link:
+        day_href = day_link.get("href", "")
+        m = re.search(r"/for/(\d{4})/(\d{2})/(\d{2})/", day_href)
+        if m:
+            watched_date = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+    rating_span = row.select_one("td.col-rating span.rating")
+    rating = None
+    if rating_span:
+        classes = rating_span.get("class", [])
+        for cls in classes:
+            m = re.match(r"rated-(\d+)", cls)
+            if m:
+                rating = int(m.group(1)) / 2  # 0-10 scale -> 0-5 stars
+                break
+
+    liked = row.select_one("td.col-like span.icon-liked") is not None
+
+    rewatch_td = row.select_one("td.col-rewatch")
+    rewatch = bool(rewatch_td) and "icon-status-off" not in rewatch_td.get("class", [])
+
+    return {
+        "letterboxd_filmtitle": film_title,
+        "letterboxd_filmyear": film_year,
+        "letterboxd_memberrating": str(rating) if rating is not None else None,
+        "letterboxd_rewatch": "Yes" if rewatch else "No",
+        "letterboxd_memberlike": "Yes" if liked else "No",
+        "letterboxd_watcheddate": watched_date,
+        "link": link,
+    }
+
+
+def fetch_diary_year_entries(username, year, max_pages=DIARY_MAX_PAGES):
+    """Scrape a user's Letterboxd diary for a single year, oldest first."""
+    entries = []
+    for page in range(1, max_pages + 1):
+        url = DIARY_YEAR_URL.format(username=username, year=year, page=page)
+        try:
+            resp = requests.get(
+                url,
+                headers={"User-Agent": DIARY_USER_AGENT},
+                timeout=15,
+            )
+        except requests.RequestException as exc:
+            print(f"[warn] diary scrape failed for {username} p{page}: {exc}", file=sys.stderr)
+            break
+
+        if not resp.ok:
+            print(f"[warn] diary scrape HTTP {resp.status_code} for {username} p{page}", file=sys.stderr)
+            break
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        rows = soup.select("tr.diary-entry-row")
+        if not rows:
+            break
+
+        for row in rows:
+            parsed = _parse_diary_row(row, username)
+            if parsed:
+                entries.append(parsed)
+
+        # A short page (fewer rows than a full page) means we've reached
+        # the end of this year's diary - no need to request further pages.
+        if len(rows) < 25:
+            break
+
     entries.reverse()
     return entries
 
@@ -496,14 +606,15 @@ HELP_TEXT = (
     "/lista - mostra gli utenti monitorati in questo gruppo\n"
     "/aggiungi Nome Cognome usernameletterboxd - aggiungi un utente a questo gruppo\n"
     "/rimuovi usernameletterboxd - rimuovi un utente da questo gruppo\n"
-    "/film titolo - mostra chi nel gruppo ha visto un film e con che voto\n"
+    "/film titolo - mostra chi nel gruppo ha visto un film quest'anno e con che voto\n"
     "/sfida nome1 nome2 [giorni] - confronta quanti film hanno visto due utenti (default 7 giorni)\n"
     "/stats - statistiche di gruppo (film totali, utente più attivo, voto medio, ecc.)\n"
     "/stop - disattiva il digest giornaliero in questo gruppo\n"
     "/help - mostra questo messaggio\n\n"
     "Ogni gruppo ha la propria lista di utenti Letterboxd, indipendente dagli altri.\n"
-    "Nota: /film, /sfida e /stats usano solo le attività più recenti disponibili nel feed "
-    "di ciascun utente (non l'intero storico Letterboxd)."
+    "Nota: /film guarda il diario dell'anno corrente di ciascun utente (scraping mirato, "
+    "non l'intero storico). /sfida e /stats usano invece le attività più recenti "
+    "disponibili nel feed RSS di ciascun utente."
 )
 
 
@@ -559,9 +670,10 @@ def handle_command(text, chat_id):
         if not users:
             return "Nessun utente configurato in questo gruppo. Usa /aggiungi per iniziare."
         query_lower = query.lower()
+        current_year = datetime.now(timezone.utc).year
         matches = []
         for display_name, username in users.items():
-            for entry in fetch_all_entries(username):
+            for entry in fetch_diary_year_entries(username, current_year):
                 title = entry.get("letterboxd_filmtitle")
                 if title and query_lower in title.lower():
                     matches.append((display_name, entry))
@@ -569,7 +681,7 @@ def handle_command(text, chat_id):
         if not matches:
             return (
                 f"Nessuno ha visto un film che corrisponde a '{html.escape(query)}' "
-                "(tra le attività recenti disponibili nel feed di ciascun utente)."
+                f"nel diario {current_year} di questo gruppo."
             )
 
         matches.sort(
