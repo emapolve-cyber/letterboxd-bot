@@ -171,6 +171,12 @@ def collect_entries(chat_id, since):
 
 
 def build_weekly_report_text(collected):
+    # Only count actual watched films. The RSS feed also contains other
+    # activity (e.g. ranked list updates like "Il mio Miyazaki"), which
+    # has no letterboxd:filmTitle and isn't a watched film - it shouldn't
+    # be counted towards "film visti questa settimana".
+    collected = [(name, entry) for name, entry in collected if entry.get("letterboxd_filmtitle")]
+
     if not collected:
         return "\U0001f4ca <b>Report settimanale</b>\n\nNessuna attività Letterboxd negli ultimi 7 giorni."
 
