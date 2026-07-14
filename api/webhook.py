@@ -502,6 +502,30 @@ def handle_command(text, chat_id):
         save_users(chat_id, users)
         return f"Aggiunto a questo gruppo: {html.escape(display_name)} → {html.escape(username)}"
 
+    if lower.startswith("/debug"):
+        parts = stripped.split()
+        if len(parts) != 2:
+            return "Uso corretto: /debug usernameletterboxd"
+        username = parts[1]
+        feed = feedparser.parse(RSS_URL.format(username=username))
+        if feed.bozo and not feed.entries:
+            return f"Errore lettura feed per {html.escape(username)}: {html.escape(str(feed.bozo_exception))}"
+        now = datetime.now(timezone.utc)
+        lines = [
+            f"<b>Debug feed:</b> {html.escape(username)} ({len(feed.entries)} voci totali nel feed)",
+            f"Ora server (UTC): {html.escape(now.isoformat())}\n",
+        ]
+        for entry in feed.entries[:20]:
+            title = entry.get("letterboxd_filmtitle") or entry.get("title", "?")
+            watched = entry.get("letterboxd_watcheddate", "MANCANTE")
+            pub = entry.get("published", "MANCANTE")
+            computed = _entry_date_utc(entry)
+            lines.append(
+                f"- {html.escape(str(title))} | watched={html.escape(str(watched))} | "
+                f"pub={html.escape(str(pub))} | computed_utc={computed}"
+            )
+        return "\n".join(lines)
+
     if lower.startswith("/rimuovi"):
         parts = stripped.split()
         if len(parts) != 2:
