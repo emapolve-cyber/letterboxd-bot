@@ -502,6 +502,25 @@ def handle_command(text, chat_id):
         save_users(chat_id, users)
         return f"Aggiunto a questo gruppo: {html.escape(display_name)} → {html.escape(username)}"
 
+    if lower.startswith("/debugtop"):
+        parts = stripped.split()
+        if len(parts) != 2:
+            return "Uso corretto: /debugtop usernameletterboxd"
+        username = parts[1]
+        since = datetime.now(timezone.utc) - timedelta(hours=WEEKLY_LOOKBACK_HOURS)
+        entries = fetch_new_entries(username, since)
+        lines = [
+            f"<b>Debugtop:</b> {html.escape(username)}",
+            f"WEEKLY_LOOKBACK_HOURS={WEEKLY_LOOKBACK_HOURS}",
+            f"since={since.isoformat()}",
+            f"entries trovate (dopo filtro+dedup): {len(entries)}\n",
+        ]
+        for entry in entries:
+            title = entry.get("letterboxd_filmtitle") or entry.get("title", "?")
+            watched = entry.get("letterboxd_watcheddate", "MANCANTE")
+            lines.append(f"- {html.escape(str(title))} | watched={html.escape(str(watched))}")
+        return "\n".join(lines)
+
     if lower.startswith("/debug"):
         parts = stripped.split()
         if len(parts) != 2:
