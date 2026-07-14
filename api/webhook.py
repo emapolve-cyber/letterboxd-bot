@@ -233,9 +233,11 @@ def format_entry(entry):
     film_year = entry.get("letterboxd_filmyear")
     rating = entry.get("letterboxd_memberrating")
     rewatch = entry.get("letterboxd_rewatch") == "Yes"
+    liked = entry.get("letterboxd_memberlike") == "Yes"
     link = entry.get("link", "")
 
     stars = stars_from_rating(rating)
+    heart = " ❤️" if liked else ""
     rewatch_icon = " \U0001f501" if rewatch else ""
 
     if film_title:
@@ -245,6 +247,7 @@ def format_entry(entry):
         line = f"\U0001f3ac <a href=\"{html.escape(link)}\">{title_part}</a>"
         if stars:
             line += f" {stars}"
+        line += heart
         line += rewatch_icon
     else:
         title_part = html.escape(entry.get("title", "Nuovo contenuto"))
@@ -335,8 +338,9 @@ def build_weekly_report_text(collected):
             if film_year:
                 title_part += f" ({html.escape(str(film_year))})"
             stars = stars_from_rating(rating_value)
+            heart = " ❤️" if entry.get("letterboxd_memberlike") == "Yes" else ""
             lines.append(
-                f"{i}. <a href=\"{html.escape(link)}\">{title_part}</a> {stars} — {html.escape(display_name)}"
+                f"{i}. <a href=\"{html.escape(link)}\">{title_part}</a> {stars}{heart} — {html.escape(display_name)}"
             )
 
     return "\n".join(lines)
