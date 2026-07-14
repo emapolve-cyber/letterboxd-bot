@@ -122,6 +122,7 @@ def fetch_new_entries(username, since):
         return []
 
     new_entries = []
+    seen = set()
     for entry in feed.entries:
         published = entry.get("published_parsed") or entry.get("updated_parsed")
         if not published:
@@ -129,6 +130,19 @@ def fetch_new_entries(username, since):
         published_dt = datetime.fromtimestamp(time.mktime(published), tz=timezone.utc)
         if published_dt < since:
             continue
+
+        # Letterboxd's RSS feed can list the same diary log more than once
+        # (e.g. after the entry is edited). Skip repeats of the same film
+        # logged on the same watched date so it isn't counted twice.
+        dedup_key = (
+            entry.get("letterboxd_filmtitle"),
+            entry.get("letterboxd_filmyear"),
+            entry.get("letterboxd_watcheddate"),
+        )
+        if dedup_key[0] and dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+
         new_entries.append(entry)
 
     new_entries.reverse()
