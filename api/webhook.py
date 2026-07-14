@@ -186,20 +186,21 @@ def _entry_date_utc(entry):
     return datetime.fromtimestamp(calendar.timegm(published), tz=timezone.utc)
 
 
-def fetch_new_entries(username, since):
+def _parse_feed_entries(username):
+    """Fetch and dedupe every entry currently in a user's Letterboxd RSS
+    feed, newest first. Letterboxd's RSS only exposes the user's most
+    recent activity (roughly their last 50-100 diary entries) - this is
+    NOT their full watch history.
+    """
     url = RSS_URL.format(username=username)
     feed = feedparser.parse(url)
     if feed.bozo and not feed.entries:
         print(f"[warn] could not read feed for {username}: {feed.bozo_exception}", file=sys.stderr)
         return []
 
-    new_entries = []
+    entries = []
     seen = set()
     for entry in feed.entries:
-        entry_dt = _entry_date_utc(entry)
-        if not entry_dt or entry_dt < since:
-            continue
-
         # Letterboxd's RSS feed can list the same diary log more than once
         # (e.g. after the entry is edited). Skip repeats of the same film
         # logged on the same watched date so it isn't counted twice.
@@ -211,11 +212,30 @@ def fetch_new_entries(username, since):
         if dedup_key[0] and dedup_key in seen:
             continue
         seen.add(dedup_key)
+        entries.append(entry)
 
-        new_entries.append(entry)
+    return entries
 
-    new_entries.reverse()
-    return new_entries
+
+def fetch_new_entries(username, since):
+    """Entries watched/published on or after `since`, oldest first."""
+    matched = []
+    for entry in _parse_feed_entries(username):
+        entry_dt = _entry_date_utc(entry)
+        if not entry_dt or entry_dt < since:
+            continue
+        matched.append(entry)
+    matched.reverse()
+    return matched
+
+
+def fetch_all_entries(username):
+    """Every entry currently available in the user's feed, oldest first.
+    See _parse_feed_entries: this is recent activity, not full history.
+    """
+    entries = _parse_feed_entries(username)
+    entries.reverse()
+    return entries
 
 
 def collect_entries(chat_id, since):
@@ -476,9 +496,14 @@ HELP_TEXT = (
     "/lista - mostra gli utenti monitorati in questo gruppo\n"
     "/aggiungi Nome Cognome usernameletterboxd - aggiungi un utente a questo gruppo\n"
     "/rimuovi usernameletterboxd - rimuovi un utente da questo gruppo\n"
+    "/film titolo - mostra chi nel gruppo ha visto un film e con che voto\n"
+    "/sfida nome1 nome2 [giorni] - confronta quanti film hanno visto due utenti (default 7 giorni)\n"
+    "/stats - statistiche di gruppo (film totali, utente più attivo, voto medio, ecc.)\n"
     "/stop - disattiva il digest giornaliero in questo gruppo\n"
     "/help - mostra questo messaggio\n\n"
-    "Ogni gruppo ha la propria lista di utenti Letterboxd, indipendente dagli altri."
+    "Ogni gruppo ha la propria lista di utenti Letterboxd, indipendente dagli altri.\n"
+    "Nota: /film, /sfida e /stats usano solo le attività più recenti disponibili nel feed "
+    "di ciascun utente (non l'intero storico Letterboxd)."
 )
 
 
@@ -525,6 +550,179 @@ def handle_command(text, chat_id):
             del users[name]
         save_users(chat_id, users)
         return f"Rimosso da questo gruppo: {html.escape(', '.join(to_delete))}"
+
+    if lower.startswith("/film"):
+        query = stripped[len("/film"):].strip()
+        if not query:
+            return "Uso corretto: /film titolo del film"
+        users = get_users(chat_id)
+        if not users:
+            return "Nessun utente configurato in questo gruppo. Usa /aggiungi per iniziare."
+        query_lower = query.lower()
+        matches = []
+        for display_name, username in users.items():
+            for entry in fetch_all_entries(username):
+                title = entry.get("letterboxd_filmtitle")
+                if title and query_lower in title.lower():
+                    matches.append((display_name, entry))
+
+        if not matches:
+            return (
+                f"Nessuno ha visto un film che corrisponde a '{html.escape(query)}' "
+                "(tra le attività recenti disponibili nel feed di ciascun utente)."
+            )
+
+        matches.sort(
+            key=lambda item: _entry_date_utc(item[1]) or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
+        lines = [f"<b>\U0001f3ac Risultati per \"{html.escape(query)}\"</b>\n"]
+        for display_name, entry in matches:
+            film_title = entry.get("letterboxd_filmtitle")
+            film_year = entry.get("letterboxd_filmyear")
+            rating = entry.get("letterboxd_memberrating")
+            link = entry.get("link", "")
+            title_part = html.escape(film_title)
+            if film_year:
+                title_part += f" ({html.escape(str(film_year))})"
+            stars = stars_from_rating(rating)
+            heart = " ❤️" if entry.get("letterboxd_memberlike") == "Yes" else ""
+            watched = entry.get("letterboxd_watcheddate", "")
+            watched_part = f" ({html.escape(watched)})" if watched else ""
+            lines.append(
+                f"- <a href=\"{html.escape(link)}\">{title_part}</a> {stars}{heart} "
+                f"— {html.escape(display_name)}{watched_part}"
+            )
+        return "\n".join(lines)
+
+    if lower.startswith("/sfida"):
+        parts = stripped.split()[1:]
+        if not parts:
+            return "Uso corretto: /sfida nome1 nome2 [giorni] (nomi come in /lista, es. /sfida Fefo Arturo)"
+        days = 7
+        if parts[-1].isdigit():
+            days = max(1, int(parts[-1]))
+            parts = parts[:-1]
+        if len(parts) != 2:
+            return "Uso corretto: /sfida nome1 nome2 [giorni] (nomi come in /lista, es. /sfida Fefo Arturo)"
+
+        users = get_users(chat_id)
+
+        def find_user(query):
+            for name, uname in users.items():
+                if name.lower() == query.lower():
+                    return name, uname
+            return None
+
+        u1 = find_user(parts[0])
+        u2 = find_user(parts[1])
+        if not u1 or not u2:
+            missing = parts[0] if not u1 else parts[1]
+            return f"Utente '{html.escape(missing)}' non trovato in questo gruppo. Controlla /lista."
+
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        films1 = [e for e in fetch_new_entries(u1[1], since) if e.get("letterboxd_filmtitle")]
+        films2 = [e for e in fetch_new_entries(u2[1], since) if e.get("letterboxd_filmtitle")]
+        n1, n2 = len(films1), len(films2)
+
+        if n1 > n2:
+            verdict = f"\U0001f3c6 {html.escape(u1[0])} vince!"
+        elif n2 > n1:
+            verdict = f"\U0001f3c6 {html.escape(u2[0])} vince!"
+        else:
+            verdict = "\U0001f91d Pareggio!"
+
+        return "\n".join([
+            f"<b>⚔️ Sfida: {html.escape(u1[0])} vs {html.escape(u2[0])}</b> (ultimi {days} giorni)\n",
+            f"{html.escape(u1[0])}: {n1} film",
+            f"{html.escape(u2[0])}: {n2} film",
+            "",
+            verdict,
+        ])
+
+    if lower.startswith("/stats"):
+        users = get_users(chat_id)
+        if not users:
+            return "Nessun utente configurato in questo gruppo. Usa /aggiungi per iniziare."
+
+        per_user = {}
+        total = 0
+        for display_name, username in users.items():
+            entries = [e for e in fetch_all_entries(username) if e.get("letterboxd_filmtitle")]
+            per_user[display_name] = entries
+            total += len(entries)
+
+        if total == 0:
+            return "Nessun dato disponibile per calcolare le statistiche di gruppo."
+
+        most_active = max(per_user.items(), key=lambda kv: len(kv[1]))
+
+        ratings = []
+        rewatches = 0
+        likes = 0
+        film_watchers = {}
+        film_entry_for_key = {}
+        rated_all = []
+        for display_name, entries in per_user.items():
+            for e in entries:
+                r = e.get("letterboxd_memberrating")
+                if r:
+                    try:
+                        rv = float(r)
+                        ratings.append(rv)
+                        rated_all.append((rv, display_name, e))
+                    except (TypeError, ValueError):
+                        pass
+                if e.get("letterboxd_rewatch") == "Yes":
+                    rewatches += 1
+                if e.get("letterboxd_memberlike") == "Yes":
+                    likes += 1
+                key = (e.get("letterboxd_filmtitle"), e.get("letterboxd_filmyear"))
+                film_watchers.setdefault(key, set()).add(display_name)
+                film_entry_for_key.setdefault(key, e)
+
+        avg_rating = sum(ratings) / len(ratings) if ratings else None
+        most_shared_key, most_shared_watchers = max(film_watchers.items(), key=lambda kv: len(kv[1]))
+        rated_all.sort(key=lambda item: item[0], reverse=True)
+
+        lines = [
+            "<b>\U0001f4c8 Statistiche di gruppo</b>",
+            "<i>(basate sulle attività più recenti disponibili nel feed di ciascun utente, non sullo storico completo)</i>\n",
+            f"Film totali registrati: {total}",
+            f"Utente più attivo: {html.escape(most_active[0])} ({len(most_active[1])} film)",
+        ]
+        if avg_rating is not None:
+            lines.append(f"Voto medio del gruppo: {avg_rating:.2f} ★")
+        lines.append(f"Rewatch: {rewatches} ({rewatches / total:.0%})")
+        lines.append(f"Film con cuore: {likes} ({likes / total:.0%})")
+
+        if len(most_shared_watchers) > 1:
+            title, year = most_shared_key
+            e = film_entry_for_key[most_shared_key]
+            link = e.get("link", "")
+            title_part = html.escape(title or "?")
+            if year:
+                title_part += f" ({html.escape(str(year))})"
+            watchers = ", ".join(html.escape(n) for n in sorted(most_shared_watchers))
+            lines.append(
+                f"Film più condiviso: <a href=\"{html.escape(link)}\">{title_part}</a> "
+                f"— visto da {len(most_shared_watchers)} persone ({watchers})"
+            )
+
+        if rated_all:
+            rating_value, display_name, e = rated_all[0]
+            title = e.get("letterboxd_filmtitle")
+            year = e.get("letterboxd_filmyear")
+            link = e.get("link", "")
+            title_part = html.escape(title)
+            if year:
+                title_part += f" ({html.escape(str(year))})"
+            stars = stars_from_rating(rating_value)
+            lines.append(
+                f"Voto più alto: <a href=\"{html.escape(link)}\">{title_part}</a> {stars} — {html.escape(display_name)}"
+            )
+
+        return "\n".join(lines)
 
     return None
 
