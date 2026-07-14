@@ -14,6 +14,7 @@ import sys
 import json
 import html
 import time
+import calendar
 from urllib.parse import quote
 from http.server import BaseHTTPRequestHandler
 from datetime import datetime, timezone, timedelta
@@ -103,6 +104,31 @@ def stars_from_rating(rating):
     return "★" * full + ("½" if half else "")
 
 
+def _entry_date_utc(entry):
+    """Best-effort UTC datetime for an entry.
+
+    Prefers the explicit letterboxd:watchedDate (the day the film was
+    actually watched, plain YYYY-MM-DD, no timezone ambiguity) over the
+    RSS pubDate. pubDate reflects when the diary log was *published*,
+    which can be much later than the watch date (e.g. someone rating a
+    backlog of old films in one sitting), and would otherwise make old
+    watches look like they happened "this week".
+    """
+    watched = entry.get("letterboxd_watcheddate")
+    if watched:
+        try:
+            return datetime.strptime(watched, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    published = entry.get("published_parsed") or entry.get("updated_parsed")
+    if not published:
+        return None
+    # feedparser normalizes published_parsed/updated_parsed to UTC already;
+    # calendar.timegm (unlike time.mktime) treats the struct as UTC instead
+    # of local time, so it doesn't shift by the server's timezone.
+    return datetime.fromtimestamp(calendar.timegm(published), tz=timezone.utc)
+
+
 def fetch_new_entries(username, since):
     url = RSS_URL.format(username=username)
     feed = feedparser.parse(url)
@@ -113,11 +139,8 @@ def fetch_new_entries(username, since):
     new_entries = []
     seen = set()
     for entry in feed.entries:
-        published = entry.get("published_parsed") or entry.get("updated_parsed")
-        if not published:
-            continue
-        published_dt = datetime.fromtimestamp(time.mktime(published), tz=timezone.utc)
-        if published_dt < since:
+        entry_dt = _entry_date_utc(entry)
+        if not entry_dt or entry_dt < since:
             continue
 
         # Letterboxd's RSS feed can list the same diary log more than once
